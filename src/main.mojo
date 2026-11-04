@@ -379,7 +379,7 @@ def encode_prompt(
     return tok.encode(chat_prompt(arch, text))
 
 
-def prompt_path(a: Args) -> String:
+def prompt_path(a: Args) raises -> String:
     var path = a.get("prompt-file")
     return "/dev/stdin" if path == "-" else path
 
@@ -389,11 +389,11 @@ def read_prompt_file(a: Args) raises -> String:
     try:
         with open(path, "r") as f:
             var text = f.read()
-        if text.endswith("\r\n"):
-            return String(text[byte = : text.byte_length() - 2])
-        if text.endswith("\n"):
-            return String(text[byte = : text.byte_length() - 1])
-        return text
+            if text.endswith("\r\n"):
+                return String(text[byte = : text.byte_length() - 2])
+            if text.endswith("\n"):
+                return String(text[byte = : text.byte_length() - 1])
+            return text
     except e:
         raise Error("cannot read prompt file " + a.get("prompt-file") + ": " + String(e))
 
