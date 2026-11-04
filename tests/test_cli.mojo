@@ -190,9 +190,7 @@ def test_complete_commands_pass_the_check() raises:
     )
     assert_equal(_check("tokenize", ["--model", "m", "--prompt", "p"]), "")
     assert_equal(_check("run", ["--model", "m", "--prompt-file", "f"]), "")
-    assert_equal(
-        _check("tokenize", ["--model", "m", "--prompt-file", "f"]), ""
-    )
+    assert_equal(_check("tokenize", ["--model", "m", "--prompt-file", "f"]), "")
     assert_equal(
         _check(
             "logits",
@@ -206,7 +204,8 @@ def test_usage_for_one_command() raises:
     var run = usage_for("run")
     assert_true(
         run.startswith(
-            "usage:\n  mojo-dllm run --model M (--prompt TEXT | --prompt-file PATH)"
+            "usage:\n  mojo-dllm run --model M (--prompt TEXT | --prompt-file"
+            " PATH)"
         )
     )
     assert_true(not run.__contains__("mojo-dllm tokenize"))
@@ -214,7 +213,10 @@ def test_usage_for_one_command() raises:
     var tokenize = usage_for("tokenize")
     assert_equal(
         tokenize,
-        "usage:\n  mojo-dllm tokenize --model M (--prompt TEXT | --prompt-file PATH) [--no-chat]",
+        (
+            "usage:\n  mojo-dllm tokenize --model M (--prompt TEXT |"
+            " --prompt-file PATH) [--no-chat]"
+        ),
     )
     with assert_raises(contains="unknown command: nope"):
         _ = usage_for("nope")
@@ -825,9 +827,7 @@ def test_prompt_and_prompt_file_conflict() raises:
 
 def test_prompt_file_stands_in_for_prompt() raises:
     assert_equal(_check("run", ["--model", "m", "--prompt-file", "f"]), "")
-    assert_equal(
-        _check("tokenize", ["--model", "m", "--prompt-file", "f"]), ""
-    )
+    assert_equal(_check("tokenize", ["--model", "m", "--prompt-file", "f"]), "")
 
 
 def test_read_prompt_file_drops_one_trailing_newline() raises:
@@ -842,13 +842,17 @@ def test_read_prompt_file_drops_one_trailing_newline() raises:
 
 
 def test_read_prompt_file_names_a_missing_file() raises:
-    var a = _parse("run", ["--model", "m", "--prompt-file", "build/tests/absent.txt"])
+    var a = _parse(
+        "run", ["--model", "m", "--prompt-file", "build/tests/absent.txt"]
+    )
     var message = String("")
     try:
         _ = read_prompt_file(a)
     except e:
         message = String(e)
-    assert_true(message.startswith("cannot read prompt file build/tests/absent.txt:"))
+    assert_true(
+        message.startswith("cannot read prompt file build/tests/absent.txt:")
+    )
 
 
 def test_prompt_path_maps_dash_to_stdin() raises:

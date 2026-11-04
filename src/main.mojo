@@ -114,8 +114,8 @@ def command_usage(command: String) raises -> String:
     """The usage lines of one command, without a trailing newline."""
     if command == "run":
         return (
-            "  mojo-dllm run --model M (--prompt TEXT | --prompt-file PATH) [--max-tokens 128]"
-            " [--steps 128] [--block-length 32]\n"
+            "  mojo-dllm run --model M (--prompt TEXT | --prompt-file PATH)"
+            " [--max-tokens 128] [--steps 128] [--block-length 32]\n"
             + "                [--seed 42] [--temperature 0] [--threads N]"
             " [--device cpu|gpu]\n"
             + "                [--remasking low_confidence|random] [--threshold"
@@ -128,7 +128,10 @@ def command_usage(command: String) raises -> String:
             + "                [--eb-stability 1] [--eb-confidence 0.005]"
         )
     if command == "tokenize":
-        return "  mojo-dllm tokenize --model M (--prompt TEXT | --prompt-file PATH) [--no-chat]"
+        return (
+            "  mojo-dllm tokenize --model M (--prompt TEXT | --prompt-file"
+            " PATH) [--no-chat]"
+        )
     if command == "inspect":
         return "  mojo-dllm inspect MODEL.gguf"
     if command == "logits":
@@ -442,7 +445,9 @@ def read_prompt_file(a: Args) raises -> String:
                 return String(text[byte = : text.byte_length() - 1])
             return text
     except e:
-        raise Error("cannot read prompt file " + a.get("prompt-file") + ": " + String(e))
+        raise Error(
+            "cannot read prompt file " + a.get("prompt-file") + ": " + String(e)
+        )
 
 
 def resolve_prompt(mut a: Args) raises:
