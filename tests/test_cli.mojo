@@ -100,7 +100,7 @@ def _check(command: String, rest: List[String]) raises -> String:
 
 def test_every_command_declares_its_flags() raises:
     var run = command_spec("run")
-    assert_equal(len(run.values), 18)
+    assert_equal(len(run.values), 19)
     assert_equal(len(run.booleans), 8)
     var tokenize = command_spec("tokenize")
     assert_equal(len(tokenize.values), 3)
