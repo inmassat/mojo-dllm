@@ -925,5 +925,10 @@ def test_dual_cache_generation_on_the_host_logits_path() raises:
         assert_equal(a.tokens[i], b.tokens[i], "token " + String(i))
 
 
+def test_the_gpu_model_reads_but_does_not_run_diffusion_gemma() raises:
+    with assert_raises(contains="diffusion-gemma has no forward pass yet"):
+        _ = GpuDiffusionLM(FIX + "tiny-diffusion-gemma.gguf", max_tokens=16)
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

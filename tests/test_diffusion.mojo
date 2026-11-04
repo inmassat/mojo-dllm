@@ -221,6 +221,46 @@ def test_early_stop_keeps_the_visible_answer_dream() raises:
     _check_early_stop("tiny-dream.gguf", 510, 16)
 
 
+def _check_stop_report(path: String, mask: Int, block: Int) raises:
+    # `--json` reports steps_taken and stop_reason for every model: the passes
+    # run, and why the loop ended ("answer_fixed" exactly when it stopped early).
+    var m = DiffusionLM(FIX + path, threads=2, max_tokens=24)
+    var prompt: List[Int] = [5, 17, 300]
+    var c = GenConfig()
+    c.gen_length = 16
+    c.block_length = block
+    c.steps = 16
+    c.mask_id = mask
+    c.early_stop = False
+    var full = generate(m, prompt, c)
+    assert_equal(full.steps_taken, full.forward_passes)
+    assert_equal(full.stop_reason, "complete", path)
+    assert_true(not full.stopped_early)
+    var fixed = 0
+    for i in range(len(prompt), len(full.tokens)):
+        var e = c.copy()
+        e.early_stop = True
+        e.stop_ids = [full.tokens[i]]
+        var early = generate(m, prompt, e)
+        assert_equal(early.steps_taken, early.forward_passes)
+        if early.stopped_early:
+            fixed += 1
+            assert_equal(early.stop_reason, "answer_fixed", path)
+            break
+        assert_equal(early.stop_reason, "complete", path)
+    assert_true(
+        fixed > 0, path + ": no run stopped early, so the check is vacuous"
+    )
+
+
+def test_llada_json_members_report_steps_and_reason() raises:
+    _check_stop_report("tiny-llada.gguf", 511, 4)
+
+
+def test_dream_json_members_report_steps_and_reason() raises:
+    _check_stop_report("tiny-dream.gguf", 510, 16)
+
+
 def _threshold_cfg(threshold: Float64) -> GenConfig:
     var c = GenConfig()
     c.gen_length = 16

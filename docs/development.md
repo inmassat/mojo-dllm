@@ -54,8 +54,10 @@ live in `tests/fixtures/` and come from scripts, never from hand:
 | Fixture | Made by | Checks |
 |---|---|---|
 | `kquants.gguf`, `bad-magic.gguf`, `tiny-llada.gguf`, `tiny-llada.expected.f32`, `tiny-dream.gguf`, `tiny-dream.expected.f32`, `malformed/`, `metadata/` | `scripts/gen_fixtures.py` | GGUF parsing and rejection, decoders, `ModelConfig` validation, the forward pass against a numpy reference |
+| `tiny-diffusion-gemma.gguf`, `diffusion-gemma/` | `scripts/gen_fixtures.py` | the `diffusion-gemma` config (seed 610061): a 2-layer model with one sliding and one global layer, 4 experts, the tensor names and types of the real file, and one file per refusal (metadata only, or zero-filled tensors) |
 | `dequant-types.gguf`, `unsupported-embedding.gguf` | `scripts/gen_fixtures.py` | Q8_0/Q5_K/BF16/Q5_0 references (seed 340034) and embedding rejection before CPU/GPU allocation (no RNG) |
 | `llada-tokenizer.gguf`, `llada-tokenizer-golden.tsv`, `dream-tokenizer.gguf`, `dream-tokenizer-golden.tsv` | `scripts/gen_tokenizer_fixture.py` | tokenizer ids against `llama-tokenize` |
+| `gemma4-tokenizer-golden.tsv`, `gemma4-tokenizer-golden.provenance.json` | `scripts/gen_tokenizer_fixture.py --golden-only` | DiffusionGemma tokenizer ids against `llama-tokenize` from the ggml-org/llama.cpp#24423 branch at the commit `scripts/build_dg_ref.sh` pins; the provenance file records that commit, the model file's sha256 and the command |
 | `golden-generation.tsv` | `UPDATE_GOLDEN=1 build/tests/test_golden` | tiny LLaDA/Dream token sequences, forward-pass counts, early stopping and per-step commits |
 | `src/mojo_dllm/tokenizer/unicode_tables.mojo` | `scripts/gen_unicode_tables.py` | code point classes from llama.cpp's own tables |
 | `moe-q5.bin`, `moe-q8.bin`, `moe-q4-q5.bin`, `moe-q4-q8.bin` | `scripts/gen_moe_fixture.py` | deterministic raw expert tensors for scalar MoE comparisons, including mixed activation block sizes |
