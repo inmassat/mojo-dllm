@@ -16,6 +16,9 @@ from main import (
     _csv,
     is_top_level_help,
     model_error,
+    prompt_path,
+    read_prompt_file,
+    resolve_prompt,
     usage,
     usage_for,
 )
@@ -93,10 +96,10 @@ def _check(command: String, rest: List[String]) raises -> String:
 
 def test_every_command_declares_its_flags() raises:
     var run = command_spec("run")
-    assert_equal(len(run.values), 12)
+    assert_equal(len(run.values), 13)
     assert_equal(len(run.booleans), 8)
     var tokenize = command_spec("tokenize")
-    assert_equal(len(tokenize.values), 2)
+    assert_equal(len(tokenize.values), 3)
     assert_equal(len(tokenize.booleans), 1)
     var inspect = command_spec("inspect")
     assert_equal(len(inspect.values), 0)
@@ -182,6 +185,10 @@ def test_complete_commands_pass_the_check() raises:
         "",
     )
     assert_equal(_check("tokenize", ["--model", "m", "--prompt", "p"]), "")
+    assert_equal(_check("run", ["--model", "m", "--prompt-file", "f"]), "")
+    assert_equal(
+        _check("tokenize", ["--model", "m", "--prompt-file", "f"]), ""
+    )
     assert_equal(
         _check(
             "logits",
@@ -194,14 +201,16 @@ def test_complete_commands_pass_the_check() raises:
 def test_usage_for_one_command() raises:
     var run = usage_for("run")
     assert_true(
-        run.startswith("usage:\n  mojo-dllm run --model M --prompt TEXT")
+        run.startswith(
+            "usage:\n  mojo-dllm run --model M (--prompt TEXT | --prompt-file PATH)"
+        )
     )
     assert_true(not run.__contains__("mojo-dllm tokenize"))
     assert_true(not run.endswith("\n"))
     var tokenize = usage_for("tokenize")
     assert_equal(
         tokenize,
-        "usage:\n  mojo-dllm tokenize --model M --prompt TEXT [--no-chat]",
+        "usage:\n  mojo-dllm tokenize --model M (--prompt TEXT | --prompt-file PATH) [--no-chat]",
     )
     with assert_raises(contains="unknown command: nope"):
         _ = usage_for("nope")
@@ -546,6 +555,81 @@ def test_non_gguf_file_hint() raises:
         " error page with a .gguf name; delete the file and run ./mojo-dllm"
         " pull again",
     )
+
+
+def test_prompt_and_prompt_file_conflict() raises:
+    for command in List[String](["run", "tokenize"]):
+        var message = _check(
+            command, ["--model", "m", "--prompt", "a", "--prompt-file", "b"]
+        )
+        assert_equal(
+            message,
+            "--prompt and --prompt-file cannot be combined for '"
+            + command
+            + "'\nsee: mojo-dllm "
+            + command
+            + " --help",
+        )
+    assert_equal(
+        execute(
+            [
+                "mojo-dllm",
+                "run",
+                "--model",
+                "m",
+                "--prompt",
+                "a",
+                "--prompt-file",
+                "b",
+            ]
+        ),
+        2,
+    )
+
+
+def test_prompt_file_stands_in_for_prompt() raises:
+    assert_equal(_check("run", ["--model", "m", "--prompt-file", "f"]), "")
+    assert_equal(
+        _check("tokenize", ["--model", "m", "--prompt-file", "f"]), ""
+    )
+
+
+def test_read_prompt_file_drops_one_trailing_newline() raises:
+    var path = "build/tests/prompt.txt"
+    for content in List[String](["hello\n", "hello", "hello\r\n", "hello\n\n"]):
+        with open(path, "w") as f:
+            f.write(content)
+        var a = _parse("run", ["--model", "m", "--prompt-file", path])
+        var expected = "hello\n" if content == "hello\n\n" else "hello"
+        assert_equal(read_prompt_file(a), expected)
+    remove(path)
+
+
+def test_read_prompt_file_names_a_missing_file() raises:
+    var a = _parse("run", ["--model", "m", "--prompt-file", "build/tests/absent.txt"])
+    var message = String("")
+    try:
+        _ = read_prompt_file(a)
+    except e:
+        message = String(e)
+    assert_true(message.startswith("cannot read prompt file build/tests/absent.txt:"))
+
+
+def test_prompt_path_maps_dash_to_stdin() raises:
+    var a = _parse("run", ["--model", "m", "--prompt-file", "-"])
+    assert_equal(prompt_path(a), "/dev/stdin")
+    var b = _parse("run", ["--model", "m", "--prompt-file", "file.txt"])
+    assert_equal(prompt_path(b), "file.txt")
+
+
+def test_resolve_prompt_fills_the_prompt() raises:
+    var path = "build/tests/prompt.txt"
+    with open(path, "w") as f:
+        f.write("hi\n")
+    var a = _parse("run", ["--model", "m", "--prompt-file", path])
+    resolve_prompt(a)
+    assert_equal(a.get("prompt"), "hi")
+    remove(path)
 
 
 def test_other_errors_pass_through_unchanged() raises:

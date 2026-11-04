@@ -989,7 +989,7 @@ Required flags:
 --seed N
 ```
 
-Only `--model` and `--prompt` are required. `--max-tokens` defaults to 128, `--steps` to the value of `--max-tokens`, and `--seed` to 42. `--device` takes `cpu` or `gpu`. The built binary is `build/mojo-dllm`, and the `./mojo-dllm` launcher takes the prompt as its first word. [Command line](cli.md) lists every flag.
+Only `--model` and one of `--prompt` or `--prompt-file` are required. `--max-tokens` defaults to 128, `--steps` to the value of `--max-tokens`, and `--seed` to 42. `--device` takes `cpu` or `gpu`. The built binary is `build/mojo-dllm`, and the `./mojo-dllm` launcher takes the prompt as its first word. [Command line](cli.md) lists every flag.
 
 Optional:
 
