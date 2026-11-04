@@ -18,6 +18,8 @@ from main import (
     model_error,
     usage,
     usage_for,
+    build_id,
+    version_text,
 )
 
 
@@ -77,6 +79,16 @@ def test_usage_lists_all_commands() raises:
     var text = usage()
     for command in List[String](["run", "tokenize", "inspect", "logits"]):
         assert_true(text.__contains__("mojo-dllm " + command + " "))
+    assert_true(text.__contains__("mojo-dllm --version"))
+
+
+def test_version_reports_embedded_build_id() raises:
+    var expected = "mojo-dllm 0.1.0\ncommit: " + build_id()
+    assert_equal(version_text(), expected)
+    var decision = decide(["mojo-dllm", "--version"])
+    assert_equal(decision.code, 0)
+    assert_equal(decision.text, expected)
+    assert_true(not decision.proceed)
 
 
 def _parse(command: String, rest: List[String]) raises -> Args:

@@ -13,7 +13,7 @@
 from std.ffi import ErrNo, external_call, c_int
 from std.math import isfinite
 from std.os import getenv
-from std.sys import argv, exit, num_logical_cores
+from std.sys import argv, exit, get_defined_string, num_logical_cores
 from std.time import perf_counter_ns
 
 from cli.args import Args, parse_csv_ints, unknown_flag_error
@@ -29,6 +29,15 @@ from mojo_dllm.sys.mem import Bytes, Floats
 from mojo_dllm.tokenizer.bpe import Tokenizer
 
 comptime VERSION = "0.1.0"
+comptime GIT_SHA = get_defined_string["MOJO_DLLM_GIT_SHA", "unknown"]()
+
+
+def build_id() -> String:
+    return String(GIT_SHA)
+
+
+def version_text() -> String:
+    return "mojo-dllm " + VERSION + "\ncommit: " + build_id()
 
 
 struct CommandSpec(Movable):
@@ -129,7 +138,8 @@ def usage() raises -> String:
     return (
         "mojo-dllm "
         + VERSION
-        + ": diffusion language model inference in Mojo\n\n"
+        + ": diffusion language model inference in Mojo\n"
+        + "mojo-dllm --version\n\n"
         + "usage:\n"
         + command_usage("run")
         + "\n"
@@ -710,6 +720,8 @@ struct Decision(Movable):
 def decide(raw: List[String]) raises -> Decision:
     """Help, usage errors and valid arguments, in that order of precedence."""
     var command = raw[1] if len(raw) > 1 else String("")
+    if command == "--version":
+        return Decision(0, version_text(), False, False)
     if is_top_level_help(command):
         return Decision(0, usage(), False, False)
     if not command_known(command):

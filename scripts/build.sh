@@ -21,9 +21,15 @@ if [ -z "$arch" ]; then
         arch=sm_80
     fi
 fi
+sha=unknown
+if [ -e .git ] \
+    && head="$(git rev-parse --short=12 HEAD 2>/dev/null)" \
+    && changes="$(git status --porcelain -- src 2>/dev/null)"; then
+    sha="$head${changes:+-dirty}"
+fi
 # The compiler is the one uv.lock pins. MOJO replaces it: the sandbox that runs
 # contributor pull requests points it at a read-only copy.
 MOJO="${MOJO:-uv run --frozen mojo}"
 mkdir -p "$(dirname "$out")"
 # shellcheck disable=SC2086  # MOJO is a command with arguments
-exec $MOJO build -Werror --target-accelerator "$arch" -I src "$src" -o "$out"
+exec $MOJO build -Werror --target-accelerator "$arch" -D "MOJO_DLLM_GIT_SHA=$sha" -I src "$src" -o "$out"

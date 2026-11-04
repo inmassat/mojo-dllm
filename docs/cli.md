@@ -1,11 +1,25 @@
 # Command line
 
 ```text
+mojo-dllm --version
 mojo-dllm run      --model PATH --prompt TEXT [options]
 mojo-dllm tokenize --model PATH --prompt TEXT [--no-chat]
 mojo-dllm inspect  PATH
 mojo-dllm logits   --model PATH --tokens IDS --rows POSITIONS --out FILE [--threads N] [--device D]
 ```
+
+`mojo-dllm --version` prints the package version on its first line and the
+build-time commit on its second:
+
+```text
+mojo-dllm 0.1.0
+commit: abc123456789
+```
+
+The commit is the 12-character `HEAD` used to build the binary. It has a
+`-dirty` suffix when `src/` had pending changes, or is `unknown` when the
+build cannot read Git metadata. A binary continues to identify the commit it
+was built from even if `HEAD` later moves.
 
 This page describes the binary, `build/mojo-dllm`. The `./mojo-dllm run` launcher
 takes the prompt as its first word, accepts `-m` for `--model`, defaults
