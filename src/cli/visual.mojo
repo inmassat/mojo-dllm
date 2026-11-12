@@ -8,6 +8,12 @@ def frame_style(is_tty: Bool, no_color: String) -> Tuple[Bool, Bool]:
     return (is_tty and no_color == "", is_tty)
 
 
+def prints_answer(visual: Bool, is_tty: Bool) -> Bool:
+    """Whether `run` prints the answer after generation. On a terminal the
+    last canvas frame already shows it, so `--visual` skips the second copy."""
+    return not (visual and is_tty)
+
+
 def render_frame(
     tok: Tokenizer,
     tokens: List[Int],
@@ -33,7 +39,7 @@ def render_frame(
         if t == mask_id:
             out += esc + "[38;5;30m░" + esc + "[0m" if color else String("░")
             continue
-        if t == tok.eos_id or t == tok.eot_id:
+        if tok.is_eog(t):
             out += esc + "[38;5;240m·" + esc + "[0m" if color else String("·")
             continue
         var piece = tok.decode([t])
@@ -73,7 +79,11 @@ struct CanvasPrinter(StepObserver):
         interval: Int = 1,
         is_tty: Bool = True,
         no_color: String = "",
-    ):
+    ) raises:
+        if interval < 1:
+            raise Error(
+                "visual interval must be at least 1, got " + String(interval)
+            )
         self.tok = tok^
         self.start = start
         self.mask_id = mask_id

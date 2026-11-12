@@ -1,11 +1,15 @@
+from std.collections import Dict
 from std.testing import assert_equal, assert_true, assert_raises, TestSuite
 
 from cli.args import (
     Args,
     edit_distance,
+    env_flags,
+    env_name,
     parse_csv_ints,
     suggest_flag,
     unknown_flag_error,
+    with_env,
 )
 
 
@@ -17,7 +21,7 @@ def test_values_and_booleans() raises:
     assert_equal(a.get("prompt"), "hi")
     assert_true(a.has("prompt"))
     assert_true(a.has("json"))
-    assert_true(not a.has("absent"))
+    assert_true(not a.declares("absent"))
 
 
 def test_missing_value_is_recorded_not_raised() raises:
@@ -35,7 +39,7 @@ def test_help_before_a_trailing_value_flag_is_still_seen() raises:
 
 
 def test_missing_required_and_defaults() raises:
-    var a = Args(["x", "run"], [], [])
+    var a = Args(["x", "run"], ["model", "steps", "temperature"], [])
     with assert_raises(contains="missing required flag --model"):
         _ = a.get("model")
     assert_equal(a.get_or("model", "default"), "default")
@@ -43,19 +47,25 @@ def test_missing_required_and_defaults() raises:
     assert_equal(a.float_or("temperature", 0.5), 0.5)
 
 
-def test_flag_like_token_is_a_value() raises:
-    var a = Args(["x", "run", "--prompt", "--json"], ["prompt"], ["json"])
-    assert_equal(a.get("prompt"), "--json")
+def test_a_flag_that_is_not_declared_is_an_ordinary_value() raises:
+    # `--json` is declared boolean here, so it cannot be a prompt (see
+    # test_a_value_that_names_a_declared_flag_is_recorded); `--frob` is not
+    # declared anywhere, so it is text.
+    var a = Args(["x", "run", "--prompt", "--frob"], ["prompt"], ["json"])
+    assert_equal(a.get("prompt"), "--frob")
     assert_true(not a.has("json"))
 
 
-def test_numbers_and_last_duplicate_win() raises:
+def test_numbers_parse_and_the_last_of_a_repeat_is_kept() raises:
+    # A repeated value flag is recorded in `repeated` and refused by the
+    # command line; the parser itself still keeps the last value.
     var a = Args(
         ["x", "run", "--seed", "9", "--seed", "-5", "--temperature", "1e-3"],
         ["seed", "temperature"],
         [],
     )
     assert_equal(a.int_or("seed", 0), -5)
+    assert_equal(a.repeated, "seed")
     assert_equal(a.float_or("temperature", 0), Float64(0.001))
 
 
@@ -79,7 +89,7 @@ def test_unknown_flags_are_collected_not_stored() raises:
     var a = Args(["x", "run", "--thread", "4"], ["threads"], [])
     assert_equal(len(a.unknown), 1)
     assert_equal(a.unknown[0], "thread")
-    assert_true(not a.has("thread"))
+    assert_true(not a.declares("thread"))
     assert_equal(a.int_or("threads", 8), 8)
 
 
@@ -95,6 +105,73 @@ def test_help_after_a_value_flag_is_that_flags_value() raises:
     var a = Args(["x", "run", "--prompt", "--help"], ["prompt"], [])
     assert_equal(a.get("prompt"), "--help")
     assert_true(not a.has("help"))
+
+
+def test_csv_ints_refuse_an_empty_part_but_allow_a_trailing_comma() raises:
+    # A dropped part moves every position after it: `--rows 0,,2` would name
+    # two rows and read as 0,2.
+    assert_equal(parse_csv_ints("0,1,2"), [0, 1, 2])
+    assert_equal(parse_csv_ints("0,1,"), [0, 1])
+    assert_equal(parse_csv_ints(" 4 , 5 "), [4, 5])
+    assert_equal(len(parse_csv_ints("")), 0)
+    with assert_raises(contains="empty entry 2 in '0,,2'"):
+        _ = parse_csv_ints("0,,2")
+    with assert_raises(contains="empty entry 1 in ',1'"):
+        _ = parse_csv_ints(",1")
+    with assert_raises(contains="empty entry 1 in ',,'"):
+        _ = parse_csv_ints(",,")
+
+
+def test_a_lookup_of_an_undeclared_name_raises() raises:
+    # `a.int_or("max-token", 128)` used to compile and return the default.
+    var a = Args(["x", "run", "--steps", "4"], ["steps"], ["json"])
+    assert_equal(a.int_or("steps", 1), 4)
+    assert_true(not a.has("json"))
+    assert_true(not a.has("help"))
+    var message = "internal error: flag --max-token is not declared for 'run'"
+    with assert_raises(contains=message):
+        _ = a.int_or("max-token", 128)
+    with assert_raises(contains=message):
+        _ = a.has("max-token")
+    with assert_raises(contains=message):
+        _ = a.get("max-token")
+    with assert_raises(contains=message):
+        _ = a.get_or("max-token", "x")
+    with assert_raises(contains=message):
+        _ = a.float_or("max-token", 0.5)
+    assert_true(a.declares("steps"))
+    assert_true(a.declares("json"))
+    assert_true(not a.declares("max-token"))
+
+
+def test_a_value_that_names_a_declared_flag_is_recorded() raises:
+    var a = Args(
+        ["x", "run", "--prompt", "--json", "--steps", "4"],
+        ["prompt", "steps"],
+        ["json"],
+    )
+    assert_equal(a.flag_value, "prompt")
+    assert_equal(a.flag_value_text, "--json")
+    assert_true(not a.has("prompt"))
+    # A value that is not a declared name is a value, whatever it looks like.
+    var b = Args(["x", "run", "--prompt", "--frob"], ["prompt"], ["json"])
+    assert_equal(b.flag_value, "")
+    assert_equal(b.get("prompt"), "--frob")
+
+
+def test_a_repeated_value_flag_is_recorded() raises:
+    var a = Args(
+        ["x", "run", "--steps", "4", "--seed", "1", "--steps", "9"],
+        ["steps", "seed"],
+        [],
+    )
+    assert_equal(a.repeated, "steps")
+    var b = Args(
+        ["x", "run", "--steps", "4", "--seed", "1"], ["steps", "seed"], []
+    )
+    assert_equal(b.repeated, "")
+    var c = Args(["x", "run", "--json", "--json"], [], ["json"])
+    assert_equal(c.repeated, "")
 
 
 def test_edit_distance() raises:
@@ -141,8 +218,8 @@ def test_unknown_flag_error_without_suggestion() raises:
     )
 
 
-def test_csv_skips_empty_and_strips_whitespace() raises:
-    var a = parse_csv_ints("1,2,,3")
+def test_csv_strips_whitespace_and_allows_a_trailing_comma() raises:
+    var a = parse_csv_ints("1,2,3,")
     assert_equal(len(a), 3)
     for i in range(3):
         assert_equal(a[i], i + 1)
@@ -153,6 +230,120 @@ def test_csv_skips_empty_and_strips_whitespace() raises:
     assert_equal(len(parse_csv_ints("")), 0)
     with assert_raises():
         _ = parse_csv_ints("a")
+
+
+def _env_value_flags() -> List[String]:
+    # The value flags of `run` that `env_flags()` covers, plus `prompt` (which
+    # gets no variable) so the parser in the tests matches the real command.
+    return List[String](
+        [
+            "model",
+            "max-tokens",
+            "steps",
+            "block-length",
+            "seed",
+            "temperature",
+            "threads",
+            "device",
+            "remasking",
+            "threshold",
+            "prompt",
+        ]
+    )
+
+
+def test_env_name() raises:
+    assert_equal(env_name("max-tokens"), "MOJO_DLLM_MAX_TOKENS")
+    assert_equal(env_name("model"), "MOJO_DLLM_MODEL")
+
+
+def test_env_fills_an_absent_flag() raises:
+    var env = Dict[String, String]()
+    env["MOJO_DLLM_STEPS"] = "8"
+    var _t = with_env(
+        List[String](["mojo-dllm", "run", "--model", "m"]),
+        _env_value_flags(),
+        List[String](["json"]),
+        env,
+    )
+    var argv = _t[0].copy()
+    var names = _t[1].copy()
+    assert_equal(
+        argv, List[String](["mojo-dllm", "run", "--steps", "8", "--model", "m"])
+    )
+    assert_equal(names, List[String](["steps"]))
+
+
+def test_command_line_beats_env() raises:
+    var env = Dict[String, String]()
+    env["MOJO_DLLM_STEPS"] = "8"
+    var _t = with_env(
+        List[String](["mojo-dllm", "run", "--model", "m", "--steps", "4"]),
+        _env_value_flags(),
+        List[String](["json"]),
+        env,
+    )
+    var argv = _t[0].copy()
+    var names = _t[1].copy()
+    assert_equal(
+        argv,
+        List[String](["mojo-dllm", "run", "--model", "m", "--steps", "4"]),
+    )
+    assert_equal(len(names), 0)
+
+
+def test_empty_env_value_is_unset() raises:
+    var env = Dict[String, String]()
+    env["MOJO_DLLM_STEPS"] = ""
+    var _t = with_env(
+        List[String](["mojo-dllm", "run", "--model", "m"]),
+        _env_value_flags(),
+        List[String](["json"]),
+        env,
+    )
+    var argv = _t[0].copy()
+    var names = _t[1].copy()
+    assert_equal(argv, List[String](["mojo-dllm", "run", "--model", "m"]))
+    assert_equal(len(names), 0)
+
+
+def test_env_never_sets_a_boolean_or_the_prompt() raises:
+    var env = Dict[String, String]()
+    env["MOJO_DLLM_JSON"] = "1"
+    env["MOJO_DLLM_PROMPT"] = "x"
+    env["MOJO_DLLM_VISUAL_INTERVAL"] = "2"
+    var _t = with_env(
+        List[String](["mojo-dllm", "run", "--model", "m"]),
+        _env_value_flags(),
+        List[String](["json"]),
+        env,
+    )
+    var argv = _t[0].copy()
+    var names = _t[1].copy()
+    assert_equal(argv, List[String](["mojo-dllm", "run", "--model", "m"]))
+    assert_equal(len(names), 0)
+
+
+def test_a_flag_like_value_does_not_hide_a_flag() raises:
+    # `--steps` here is the value of `--prompt`; a text scan for "--steps"
+    # would misread it as present and skip the environment fill.
+    var env = Dict[String, String]()
+    env["MOJO_DLLM_STEPS"] = "8"
+    var _t = with_env(
+        List[String](["mojo-dllm", "run", "--prompt", "--steps"]),
+        _env_value_flags(),
+        List[String](["json"]),
+        env,
+    )
+    var argv = _t[0].copy()
+    var names = _t[1].copy()
+    assert_equal(
+        argv,
+        List[String](
+            ["mojo-dllm", "run", "--steps", "8", "--prompt", "--steps"]
+        ),
+    )
+    assert_equal(names, List[String](["steps"]))
 
 
 def main() raises:

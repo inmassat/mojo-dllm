@@ -1,8 +1,10 @@
-"""Denoising loops: LLaDA's `generate.py` and Dream's `diffusion_generate`.
+"""Denoising loops: LLaDA's `generate.py`, Dream's `diffusion_generate` and
+DiffusionGemma's entropy-bounded denoiser.
 
 LLaDA (semi-autoregressive blocks, below) and Dream (one block, timestep
 schedule, see `_generate_dream`) share the model call; `generate` picks the
-loop from the model's architecture.
+loop from the model's architecture. DiffusionGemma starts from random tokens
+instead of masks and has its own loop, `_generate_diffusion_gemma`.
 
 LLaDA (ML-GSAI/LLaDA `generate.py`):
 
@@ -29,7 +31,7 @@ remasking the algorithm is deterministic and token-for-token comparable with
 the reference.
 """
 
-from std.math import exp, log
+from std.math import exp, isfinite, log, nan
 from std.time import perf_counter_ns
 
 from mojo_dllm.models.transformer import DenoisingModel, RowStats
@@ -44,7 +46,6 @@ struct GenConfig(Copyable, Movable):
     var temperature: Float64
     var remasking: String
     var seed: Int
-    var mask_id: Int
     var full_logits: Bool
     var eps: Float64
     """Dream's final timestep: timesteps run linspace(1, eps, steps + 1)."""
@@ -63,6 +64,20 @@ struct GenConfig(Copyable, Movable):
     """LLaDA: also commit every candidate whose confidence reaches this value
     (Fast-dLLM's parallel decoding). 0 turns it off. A step never commits
     fewer tokens than the schedule, so a block never takes more steps."""
+    var eb_steps: Int
+    """DiffusionGemma: most denoising steps (the reference's 48)."""
+    var eb_t_min: Float64
+    """DiffusionGemma: the temperature the schedule approaches at the last
+    step (0.4). The last step runs at t_min + (t_max - t_min) / steps."""
+    var eb_t_max: Float64
+    """DiffusionGemma: the temperature of the first step (0.8)."""
+    var eb_bound: Float64
+    """DiffusionGemma: positions are accepted while the entropies before them,
+    lowest first, sum to at most this (0.1)."""
+    var eb_stability: Int
+    """DiffusionGemma: steps the argmax canvas must hold (1)."""
+    var eb_confidence: Float64
+    """DiffusionGemma: stop once the mean entropy is below this (0.005)."""
 
     def __init__(out self):
         self.gen_length = 128
@@ -71,7 +86,6 @@ struct GenConfig(Copyable, Movable):
         self.temperature = 0.0
         self.remasking = "low_confidence"
         self.seed = 42
-        self.mask_id = 126336
         self.full_logits = False
         self.eps = 1e-3
         self.threads = 1
@@ -79,6 +93,42 @@ struct GenConfig(Copyable, Movable):
         self.stop_ids = List[Int]()
         self.threshold = 0.0
         self.dual_cache = False
+        self.eb_steps = 48
+        self.eb_t_min = 0.4
+        self.eb_t_max = 0.8
+        self.eb_bound = 0.1
+        self.eb_stability = 1
+        self.eb_confidence = 0.005
+
+
+def int_flag_rule(flag: String, n: Int) -> String:
+    """The range rule an integer generation flag breaks, or "" when `n` is fine.
+
+    The one place the ranges live: the command line words its usage error from
+    it (`flag --steps must be at least 1, got 0`) and the sampler words its own
+    refusal from it (`--eb-steps must be at least 1, got 0`).
+    """
+    if flag == "eb-stability":
+        return "must be at least 0" if n < 0 else ""
+    if flag == "seed":
+        return ""
+    return "must be at least 1" if n < 1 else ""
+
+
+def float_flag_rule(flag: String, x: Float64) -> String:
+    """The range rule a float generation flag breaks, or "" when `x` is fine.
+
+    A NaN or an infinity breaks every rule: `x > 0` is false for NaN, so an
+    unchecked NaN temperature reads as greedy and a NaN threshold never fires.
+    """
+    if not isfinite(x):
+        return "must be a finite number"
+    if flag == "eb-t-max" or flag == "prev-temp-inv":
+        return "must be above 0" if x <= 0 else ""
+    if flag == "threshold":
+        return "must be between 0 and 1" if x < 0 or x > 1 else ""
+    # temperature, eb-t-min, eb-bound, eb-confidence
+    return "must be at least 0" if x < 0 else ""
 
 
 struct GenResult(Movable):
@@ -87,6 +137,11 @@ struct GenResult(Movable):
     var forward_passes: Int
     var seconds: Float64
     var stopped_early: Bool
+    var stop_reason: String
+    """Why the loop ended: "complete" (the schedule ran out), "answer_fixed"
+    (LLaDA and Dream early stop), "converged" (DiffusionGemma's argmax held
+    and its mean entropy fell below the threshold) or "max_steps"
+    (DiffusionGemma used every step)."""
 
     def __init__(out self):
         self.tokens = List[Int]()
@@ -94,6 +149,11 @@ struct GenResult(Movable):
         self.forward_passes = 0
         self.seconds = 0.0
         self.stopped_early = False
+        self.stop_reason = "complete"
+
+    def steps_taken(self) -> Int:
+        """Denoising steps run: one forward pass each."""
+        return self.forward_passes
 
 
 struct Rng(Movable):
@@ -140,6 +200,14 @@ struct Rng(Movable):
             1.0 / 9007199254740992.0
         )
 
+    def below(mut self, n: Int) raises -> Int:
+        """Uniform in [0, n): the 53 high bits scaled, unbiased to 2^-53. `n`
+        must be positive."""
+        if n <= 0:
+            raise Error("Rng.below needs a positive bound, got " + String(n))
+        var x = Float64(self.next_u64() >> 11) * (1.0 / 9007199254740992.0)
+        return min(Int(x * Float64(n)), n - 1)
+
 
 trait StepObserver:
     """Receives the canvas after every denoising step (for live display)."""
@@ -172,7 +240,8 @@ def select_top(conf: List[Float64], k: Int) -> List[Int]:
     var idx = List[Int](capacity=len(conf))
     for i in range(len(conf)):
         idx.append(i)
-    # Insertion sort: candidates per step are at most one block (tens of items).
+    # Insertion sort: O(n^2) in the candidates of a step, which are one block
+    # for LLaDA and the whole generation region for Dream.
     for a in range(1, len(idx)):
         var v = idx[a]
         var b = a - 1
@@ -185,6 +254,30 @@ def select_top(conf: List[Float64], k: Int) -> List[Int]:
     for i in range(n):
         out.append(idx[i])
     return out^
+
+
+def _z_ok(z: Float64) -> Bool:
+    """True when z, the sum of exp(logit - row maximum), is what a finite row
+    gives: at least 1 (the maximum contributes exactly 1) and below infinity.
+    A NaN fails the first test. A row with a NaN or a +inf logit, or with every
+    logit -inf, gives z = inf here, because `exp` of NaN is inf in this
+    runtime, and that fails the second."""
+    return z >= 1.0 and isfinite(z)
+
+
+def _refuse_non_finite(position: Int, step: Int) -> Error:
+    """The error for a logits row whose probabilities are not numbers.
+
+    A NaN or an infinity in a row makes `x > mx` false, so the argmax falls
+    back to token 0 and the confidence is NaN, which `select_top` then orders
+    by index: the loop would commit token 0 and report "complete".
+    """
+    return Error(
+        "non-finite logits at canvas position "
+        + String(position)
+        + ", step "
+        + String(step)
+    )
 
 
 def argmax_and_prob(row: F32Ptr, vocab: Int) -> Tuple[Int, Float64]:
@@ -200,7 +293,7 @@ def argmax_and_prob(row: F32Ptr, vocab: Int) -> Tuple[Int, Float64]:
     var m64 = Float64(mx)
     for v in range(vocab):
         z += exp(Float64(row.unsafe_load(v)) - m64)
-    return (best, 1.0 / z)
+    return (best, 1.0 / z if _z_ok(z) else nan[DType.float64]())
 
 
 def _gumbel_argmax(
@@ -298,8 +391,13 @@ def generate_observed[
     mut model: M, prompt: List[Int], cfg: GenConfig, mut obs: O
 ) raises -> GenResult:
     """Like `generate`, calling `obs.on_step` after every denoising step."""
+    var rule = float_flag_rule("temperature", cfg.temperature)
+    if rule.byte_length() > 0:
+        raise _eb_flag_error("temperature", rule, String(cfg.temperature))
     if model.config().arch == "dream":
         return _generate_dream(model, prompt, cfg, obs)
+    if model.config().arch == "diffusion-gemma":
+        return _generate_diffusion_gemma(model, prompt, cfg, obs)
     return _generate_llada(model, prompt, cfg, obs)
 
 
@@ -345,11 +443,12 @@ def _generate_llada[
     var P = len(prompt)
     var L = P + cfg.gen_length
     var vocab = model.config().vocab
+    var mask_id = model.config().mask_id
     var res = GenResult()
     for t in prompt:
         res.tokens.append(t)
     for _ in range(cfg.gen_length):
-        res.tokens.append(cfg.mask_id)
+        res.tokens.append(mask_id)
     var rng = Rng(cfg.seed)
     # Greedy decoding scores each row from four numbers the device reduces, so
     # the logits never leave it. Gumbel noise needs the rows on the host, and
@@ -371,14 +470,14 @@ def _generate_llada[
         var b1 = b0 + cfg.block_length
         var m = 0
         for i in range(b0, b1):
-            if res.tokens[i] == cfg.mask_id:
+            if res.tokens[i] == mask_id:
                 m += 1
         var schedule = num_transfer_tokens(m, steps_per_block)
         for s in range(steps_per_block):
             var t_step = perf_counter_ns()
             var cand = List[Int]()
             for i in range(b0, b1):
-                if res.tokens[i] == cfg.mask_id:
+                if res.tokens[i] == mask_id:
                     cand.append(i)
             if len(cand) == 0:
                 break
@@ -412,13 +511,22 @@ def _generate_llada[
                     var row = logits.ptr().unsafe_offset(row_of[j] * vocab)
                     var tok = _gumbel_argmax(row, vocab, cfg.temperature, rng)
                     x0.append(tok)
+                    var p = _prob_of(row, vocab, tok)
+                    if not isfinite(p):
+                        raise _refuse_non_finite(
+                            cand[j] - P, res.forward_passes
+                        )
                     if cfg.remasking == "random":
                         conf.append(rng.uniform())
                     else:
-                        conf.append(_prob_of(row, vocab, tok))
+                        conf.append(p)
             elif use_stats:
                 x0 = stats.tok.copy()
                 for j in range(len(cand)):
+                    if not _z_ok(stats.z[j]):
+                        raise _refuse_non_finite(
+                            cand[j] - P, res.forward_passes
+                        )
                     if cfg.remasking == "random":
                         conf.append(rng.uniform())
                     else:
@@ -427,6 +535,11 @@ def _generate_llada[
                 var greedy = _greedy_rows(
                     logits.ptr(), row_of, vocab, "llada", cfg.threads
                 )
+                for j in range(len(cand)):
+                    if not isfinite(greedy[1][j]):
+                        raise _refuse_non_finite(
+                            cand[j] - P, res.forward_passes
+                        )
                 x0 = greedy[0].copy()
                 if cfg.remasking == "random":
                     for _ in range(len(cand)):
@@ -447,13 +560,15 @@ def _generate_llada[
             res.step_ms.append(Float64(perf_counter_ns() - t_step) / 1e6)
             obs.on_step(res.tokens, committed, res.forward_passes, cfg.steps)
             if cfg.early_stop and answer_is_fixed(
-                res.tokens, P, cfg.mask_id, cfg.stop_ids
+                res.tokens, P, mask_id, cfg.stop_ids
             ):
                 res.stopped_early = True
                 break
         if res.stopped_early:
             break
     res.seconds = Float64(perf_counter_ns() - t_start) / 1e9
+    if res.stopped_early:
+        res.stop_reason = "answer_fixed"
     return res^
 
 
@@ -464,6 +579,8 @@ def _prob_of(row: F32Ptr, vocab: Int, tok: Int) -> Float64:
     var z = Float64(0)
     for v in range(vocab):
         z += exp(Float64(row.unsafe_load(v)) - Float64(mx))
+    if not _z_ok(z):
+        return nan[DType.float64]()
     return exp(Float64(row.unsafe_load(tok)) - Float64(mx)) / z
 
 
@@ -491,6 +608,8 @@ def _confidence(
         z += exp(x - m64)
         if v != best and x > second:
             second = x
+    if not _z_ok(z):
+        return (best, nan[DType.float64]())
     var p_best = 1.0 / z
     if algorithm == "maskgit_plus":
         return (best, p_best)
@@ -561,11 +680,12 @@ def _generate_dream[
             "Dream needs at least one prompt token (logits are shifted)"
         )
     var vocab = model.config().vocab
+    var mask_id = model.config().mask_id
     var res = GenResult()
     for t in prompt:
         res.tokens.append(t)
     for _ in range(cfg.gen_length):
-        res.tokens.append(cfg.mask_id)
+        res.tokens.append(mask_id)
     var use_stats = model.device_row_stats()
     var logits = Floats(1 if use_stats else cfg.gen_length * vocab)
     var stats = RowStats()
@@ -574,7 +694,7 @@ def _generate_dream[
         var t_step = perf_counter_ns()
         var cand = List[Int]()
         for p in range(P, P + cfg.gen_length):
-            if res.tokens[p] == cfg.mask_id:
+            if res.tokens[p] == mask_id:
                 cand.append(p)
         if len(cand) == 0:
             break
@@ -588,7 +708,10 @@ def _generate_dream[
             res.forward_passes += 1
             x0 = stats.tok.copy()
             for j in range(len(cand)):
-                conf.append(_confidence_from_stats(stats, j, algorithm))
+                var c = _confidence_from_stats(stats, j, algorithm)
+                if not _z_ok(stats.z[j]) or not isfinite(c):
+                    raise _refuse_non_finite(cand[j] - P, res.forward_passes)
+                conf.append(c)
         else:
             model.forward(res.tokens, rows, logits.ptr())
             res.forward_passes += 1
@@ -598,6 +721,9 @@ def _generate_dream[
             var greedy = _greedy_rows(
                 logits.ptr(), row_of, vocab, algorithm, cfg.threads
             )
+            for j in range(len(cand)):
+                if not isfinite(greedy[1][j]):
+                    raise _refuse_non_finite(cand[j] - P, res.forward_passes)
             x0 = greedy[0].copy()
             conf = greedy[1].copy()
         var n_transfer = len(cand)
@@ -613,9 +739,362 @@ def _generate_dream[
         res.step_ms.append(Float64(perf_counter_ns() - t_step) / 1e6)
         obs.on_step(res.tokens, committed, res.forward_passes, cfg.steps)
         if cfg.early_stop and answer_is_fixed(
-            res.tokens, P, cfg.mask_id, cfg.stop_ids
+            res.tokens, P, mask_id, cfg.stop_ids
         ):
             res.stopped_early = True
             break
     res.seconds = Float64(perf_counter_ns() - t_start) / 1e9
+    if res.stopped_early:
+        res.stop_reason = "answer_fixed"
+    return res^
+
+
+comptime EB_CHUNK = 1024
+"""Positions per chunk in `eb_row`: the draw walks chunk sums, then one chunk."""
+
+
+struct EbRow(Copyable, Movable):
+    """One canvas position's answers from its logits row."""
+
+    var argmax: Int
+    """First index of the largest logit."""
+    var entropy: Float64
+    """Entropy in nats of softmax(logits / temperature)."""
+    var sampled: Int
+    """The index an inverse-CDF draw at u picks from that softmax."""
+
+    def __init__(out self, argmax: Int, entropy: Float64, sampled: Int):
+        self.argmax = argmax
+        self.entropy = entropy
+        self.sampled = sampled
+
+
+def eb_row(row: F32Ptr, vocab: Int, temperature: Float64, u: Float64) -> EbRow:
+    """Argmax, entropy and one draw for a logits row, reading it once.
+
+    The reference scans the row three times: for the maximum, for the sum Z of
+    exp(z - max) and then for the entropy and the draw (z = logit / t). Here
+    one pass over `EB_CHUNK`-wide chunks keeps, per chunk, its own maximum m_c,
+    sum Z_c = sum exp(z - m_c) and A_c = sum exp(z - m_c)(z - m_c), and merges
+    them into the row's (m, Z, A) with exp(m_c - m) as the common factor. Then
+    H = ln Z - A / Z. The draw needs Z, so it finds the chunk holding
+    u * Z from the chunk sums and rescans only that chunk (at most
+    `EB_CHUNK` values) for the first index whose running sum reaches the
+    target, as the reference does over the whole row. Sums are in f64.
+    A row with a non-finite value gives a non-finite entropy.
+    """
+    var inv = 1.0 / temperature
+    var n_chunks = (vocab + EB_CHUNK - 1) // EB_CHUNK
+    var cm = List[Float64](length=n_chunks, fill=0.0)
+    var cz = List[Float64](length=n_chunks, fill=0.0)
+    var best = 0
+    var best_raw = row.unsafe_load(0)
+    var gm = Float64(0)
+    var gz = Float64(0)
+    var ga = Float64(0)
+    for c in range(n_chunks):
+        var lo = c * EB_CHUNK
+        var hi = min(lo + EB_CHUNK, vocab)
+        var first = row.unsafe_load(lo)
+        if first > best_raw:
+            best_raw = first
+            best = lo
+        var m = Float64(first) * inv
+        var z = Float64(1)
+        var a = Float64(0)
+        for v in range(lo + 1, hi):
+            var raw = row.unsafe_load(v)
+            if raw > best_raw:
+                best_raw = raw
+                best = v
+            var x = Float64(raw) * inv
+            if x > m:
+                var d = m - x
+                var k = exp(d)
+                a = k * (a + d * z)
+                z = k * z + 1.0
+                m = x
+            else:
+                var e = exp(x - m)
+                z += e
+                a += e * (x - m)
+        cm[c] = m
+        cz[c] = z
+        if c == 0:
+            gm = m
+            gz = z
+            ga = a
+        else:
+            var nm = max(gm, m)
+            var kg = exp(gm - nm)
+            var kc = exp(m - nm)
+            ga = kg * (ga + (gm - nm) * gz) + kc * (a + (m - nm) * z)
+            gz = kg * gz + kc * z
+            gm = nm
+    var entropy = log(gz) - ga / gz
+    var target = u * gz
+    var cum = Float64(0)
+    var chunk = n_chunks - 1
+    for c in range(n_chunks):
+        var w = cz[c] * exp(cm[c] - gm)
+        if cum + w >= target:
+            chunk = c
+            break
+        cum += w
+    var lo = chunk * EB_CHUNK
+    var hi = min(lo + EB_CHUNK, vocab)
+    var sampled = hi - 1
+    for v in range(lo, hi):
+        cum += exp(Float64(row.unsafe_load(v)) * inv - gm)
+        if cum >= target:
+            sampled = v
+            break
+    return EbRow(best, entropy, sampled)
+
+
+def eb_temperature(
+    step: Int, steps: Int, t_min: Float64, t_max: Float64
+) -> Float64:
+    """Temperature of the 0-based `step`: t_min + (t_max - t_min) * cur / steps
+    with cur = steps - step, so t_max on the first step and t_min + (t_max -
+    t_min) / steps on the last. It does not depend on when the run stops."""
+    var cur = steps - step
+    return t_min + (t_max - t_min) * (Float64(cur) / Float64(steps))
+
+
+def eb_initial_canvas(mut rng: Rng, n: Int, vocab: Int) raises -> List[Int]:
+    """`n` ids drawn uniformly from the whole vocabulary, special tokens
+    included."""
+    var out = List[Int](capacity=n)
+    for _ in range(n):
+        out.append(rng.below(vocab))
+    return out^
+
+
+def eb_accept(entropy: List[Float64], bound: Float64) -> List[Bool]:
+    """Which positions the step accepts.
+
+    Positions are taken in ascending entropy (ties to the lower index) and a
+    position is accepted when the entropies of the positions before it sum to
+    at most `bound`, so the lowest-entropy position always goes in. The sum
+    is the reference's: a running total less the position's own entropy.
+    """
+    var n = len(entropy)
+    var order = List[Int](capacity=n)
+    for i in range(n):
+        order.append(i)
+    # Stable insertion sort; a canvas is a few hundred positions.
+    for a in range(1, n):
+        var v = order[a]
+        var b = a - 1
+        while b >= 0 and entropy[order[b]] > entropy[v]:
+            order[b + 1] = order[b]
+            b -= 1
+        order[b + 1] = v
+    var accepted = List[Bool](length=n, fill=False)
+    var total = Float64(0)
+    for k in range(n):
+        var pos = order[k]
+        total += entropy[pos]
+        if total - entropy[pos] <= bound:
+            accepted[pos] = True
+    return accepted^
+
+
+def eb_should_stop(
+    held: Int, stability: Int, mean_entropy: Float64, confidence: Float64
+) -> Bool:
+    """The argmax canvas has held for `stability` steps and the mean entropy
+    is below `confidence`."""
+    return held >= stability and mean_entropy < confidence
+
+
+def _eb_rows(
+    logits: F32Ptr,
+    rows: Int,
+    vocab: Int,
+    temperature: Float64,
+    u: List[Float64],
+    threads: Int,
+) raises -> Tuple[List[Int], List[Float64], List[Int]]:
+    """`eb_row` for each of `rows` rows, in parallel; each row is computed
+    alone, so the thread count cannot change a result."""
+    var arg_buf = Bytes(8 * max(rows, 1))
+    var ent_buf = Bytes(8 * max(rows, 1))
+    var sam_buf = Bytes(8 * max(rows, 1))
+    var ap = Pointer[Int64, MutAnyOrigin](unsafe_from_address=arg_buf.addr)
+    var ep = Pointer[Float64, MutAnyOrigin](unsafe_from_address=ent_buf.addr)
+    var sp = Pointer[Int64, MutAnyOrigin](unsafe_from_address=sam_buf.addr)
+
+    def work(j: Int) {imm}:
+        var r = eb_row(
+            logits.unsafe_offset(j * vocab), vocab, temperature, u[j]
+        )
+        ap[unsafe_offset=j] = Int64(r.argmax)
+        ep[unsafe_offset=j] = r.entropy
+        sp[unsafe_offset=j] = Int64(r.sampled)
+
+    parallel_for(work, rows, threads)
+    var arg = List[Int](capacity=rows)
+    var ent = List[Float64](capacity=rows)
+    var sam = List[Int](capacity=rows)
+    for j in range(rows):
+        arg.append(Int(ap[unsafe_offset=j]))
+        ent.append(ep[unsafe_offset=j])
+        sam.append(Int(sp[unsafe_offset=j]))
+    _ = arg_buf^
+    _ = ent_buf^
+    _ = sam_buf^
+    return (arg^, ent^, sam^)
+
+
+def _eb_flag_error(flag: String, rule: String, got: String) -> Error:
+    return Error("--" + flag + " " + rule + ", got " + got)
+
+
+def _check_eb_flags(cfg: GenConfig) raises:
+    """Refuse an entropy-bound setting outside its range, by the shared rules.
+    """
+    var rule = int_flag_rule("eb-steps", cfg.eb_steps)
+    if rule.byte_length() > 0:
+        raise _eb_flag_error("eb-steps", rule, String(cfg.eb_steps))
+    rule = int_flag_rule("eb-stability", cfg.eb_stability)
+    if rule.byte_length() > 0:
+        raise _eb_flag_error("eb-stability", rule, String(cfg.eb_stability))
+    for flag in ["eb-t-min", "eb-t-max", "eb-bound", "eb-confidence"]:
+        var x = cfg.eb_t_min
+        if flag == "eb-t-max":
+            x = cfg.eb_t_max
+        elif flag == "eb-bound":
+            x = cfg.eb_bound
+        elif flag == "eb-confidence":
+            x = cfg.eb_confidence
+        rule = float_flag_rule(flag, x)
+        if rule.byte_length() > 0:
+            raise _eb_flag_error(flag, rule, String(x))
+
+
+def _generate_diffusion_gemma[
+    M: DenoisingModel, O: StepObserver
+](
+    mut model: M, prompt: List[Int], cfg: GenConfig, mut obs: O
+) raises -> GenResult:
+    """DiffusionGemma's entropy-bounded denoiser, after
+    `diffusion_generate_entropy_bound` in llama.cpp PR 24423 (2e715c0639) and
+    transformers' `EntropyBoundSampler`.
+
+        canvas = random ids over the whole vocabulary
+        for step 0 .. S - 1:
+            t = eb_temperature(step)
+            logits = model([prompt | canvas])           # canvas rows only
+            per position: argmax, entropy of softmax(logits / t),
+                          one draw from that softmax
+            accept positions by `eb_accept`
+            canvas = draw where accepted, a fresh random id elsewhere
+            output = argmax canvas
+            stop if the argmax canvas held for `eb_stability` steps and the
+                mean entropy is below `eb_confidence`
+
+    The result's tokens are the prompt and the argmax canvas of the last step.
+    Randomness is this module's PRNG, drawn in the reference's order but
+    not its values: the canvas first, then each step's (u, renoise id) per
+    position, before the rows are scored, so a seed fixes the run whatever the
+    thread count.
+    """
+    if cfg.gen_length <= 0:
+        raise Error("generation length must be positive")
+    if cfg.gen_length != model.config().canvas:
+        # The model scores [prompt | canvas] with the canvas it declares and
+        # writes that many logits rows: a different length overflows the
+        # buffer or moves the prompt boundary.
+        raise Error(
+            "generation length "
+            + String(cfg.gen_length)
+            + " must equal the model's canvas length "
+            + String(model.config().canvas)
+            + " (diffusion.canvas_length)"
+        )
+    # The reference accepts t_min = 0: every step still runs at a positive
+    # temperature, the last at t_min + (t_max - t_min) / steps.
+    _check_eb_flags(cfg)
+    var P = len(prompt)
+    if P == 0:
+        raise Error("DiffusionGemma needs at least one prompt token")
+    var C = cfg.gen_length
+    var S = cfg.eb_steps
+    var vocab = model.config().vocab
+    var rng = Rng(cfg.seed)
+    var canvas = eb_initial_canvas(rng, C, vocab)
+    var rows = List[Int](capacity=C)
+    for i in range(C):
+        rows.append(model.logit_row(P + i))
+    var logits = Floats(C * vocab)
+    var res = GenResult()
+    for t in prompt:
+        res.tokens.append(t)
+    for t in canvas:
+        res.tokens.append(t)
+    var prev = List[Int]()
+    var held = 0
+    var finished = False
+    var u = List[Float64](length=C, fill=0.0)
+    var renoise = List[Int](length=C, fill=0)
+    var t_start = perf_counter_ns()
+    for step in range(S):
+        var t_step = perf_counter_ns()
+        var temperature = eb_temperature(step, S, cfg.eb_t_min, cfg.eb_t_max)
+        var feed = List[Int](capacity=P + C)
+        for t in prompt:
+            feed.append(t)
+        for t in canvas:
+            feed.append(t)
+        model.forward(feed, rows, logits.ptr())
+        res.forward_passes += 1
+        for pos in range(C):
+            u[pos] = rng.uniform()
+            renoise[pos] = rng.below(vocab)
+        var scored = _eb_rows(
+            logits.ptr(), C, vocab, temperature, u, cfg.threads
+        )
+        var arg = scored[0].copy()
+        var ent = scored[1].copy()
+        var sam = scored[2].copy()
+        var entropy_sum = Float64(0)
+        for pos in range(C):
+            if not isfinite(ent[pos]):
+                raise Error(
+                    "non-finite logits in canvas position "
+                    + String(pos)
+                    + " at step "
+                    + String(step + 1)
+                )
+            entropy_sum += ent[pos]
+        var accepted = eb_accept(ent, cfg.eb_bound)
+        var committed = List[Int]()
+        for pos in range(C):
+            if accepted[pos]:
+                canvas[pos] = sam[pos]
+                committed.append(P + pos)
+            else:
+                canvas[pos] = renoise[pos]
+            res.tokens[P + pos] = arg[pos]
+        var same = len(prev) == C
+        if same:
+            for pos in range(C):
+                if prev[pos] != arg[pos]:
+                    same = False
+                    break
+        held = held + 1 if same else 0
+        prev = arg^
+        var stop = eb_should_stop(
+            held, cfg.eb_stability, entropy_sum / Float64(C), cfg.eb_confidence
+        )
+        res.step_ms.append(Float64(perf_counter_ns() - t_step) / 1e6)
+        obs.on_step(res.tokens, committed, res.forward_passes, S)
+        if stop:
+            finished = True
+            break
+    res.seconds = Float64(perf_counter_ns() - t_start) / 1e9
+    res.stop_reason = "converged" if finished else "max_steps"
+    res.stopped_early = finished and res.steps_taken() < S
     return res^

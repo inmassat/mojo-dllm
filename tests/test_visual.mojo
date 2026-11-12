@@ -1,12 +1,13 @@
 from std.ffi import c_int, c_size_t, external_call
-from std.testing import assert_equal, assert_true, TestSuite
+from std.testing import assert_equal, assert_true, assert_raises, TestSuite
 
 from cli.args import Args
-from cli.visual import CanvasPrinter, frame_style, render_frame
-from main import _run
+from cli.visual import CanvasPrinter, frame_style, prints_answer, render_frame
+from main import _run, json_str
 from mojo_dllm.diffusion.sampler import (
     GenConfig,
     StepObserver,
+    generate,
     generate_observed,
 )
 from mojo_dllm.formats.gguf import GGUFFile
@@ -119,7 +120,7 @@ def _printer(
     interval: Int = 1,
     is_tty: Bool = True,
     no_color: String = "",
-) -> CanvasPrinter:
+) raises -> CanvasPrinter:
     return CanvasPrinter(tok^, 0, tok.mask_id, True, interval, is_tty, no_color)
 
 
@@ -199,6 +200,19 @@ def test_frame_style_respects_tty_and_no_color() raises:
     assert_true(empty_is_unset[0])
 
 
+def test_the_printer_refuses_an_interval_below_one() raises:
+    # `step % 0` divides by zero; cmd_run checks the flag, the constructor
+    # checks every other caller.
+    for bad in List[Int]([0, -1]):
+        var tok = _tokenizer()
+        with assert_raises(
+            contains="visual interval must be at least 1, got " + String(bad)
+        ):
+            _ = CanvasPrinter(tok^, 0, 5, True, bad)
+    var tok = _tokenizer()
+    _ = CanvasPrinter(tok^, 0, 5, True, 1)
+
+
 def test_disabled_printer_does_not_write() raises:
     var tok = _tokenizer()
     var tokens = _canvas(tok)
@@ -245,10 +259,9 @@ def test_run_finishes_when_early_stop_skips_interval() raises:
     cfg.gen_length = 8
     cfg.block_length = 8
     cfg.steps = 8
-    cfg.mask_id = 511
     cfg.early_stop = False
     cfg.threshold = 1e-30
-    var first = _FirstStep(cfg.mask_id)
+    var first = _FirstStep(511)
     _ = generate_observed(model, prompt, cfg, first)
     assert_equal(first.first_resolved_step, 1)
     tok.eot_id = first.tokens[3]
@@ -263,16 +276,15 @@ def test_run_finishes_when_early_stop_skips_interval() raises:
             "--json",
         ],
         ["visual-interval"],
-        ["visual", "json"],
+        ["visual", "json", "verbose", "dump-step-stats", "no-early-stop"],
     )
     var run_cfg = GenConfig()
     run_cfg.gen_length = 8
     run_cfg.block_length = 8
     run_cfg.steps = 8
-    run_cfg.mask_id = 511
     run_cfg.threshold = 1e-30
     var output = _OutputCapture()
-    _run(model, args, run_cfg^, prompt, tok^, 0.0, "cpu", "cpu", 1)
+    _run(model, args, run_cfg^, prompt, tok^, 0.0, "cpu", "cpu")
     var text = output.finish()
     var frame_at = text.find("denoising step 1 / 8")
     var json_at = text.find('{"runtime": "mojo-dllm"')
@@ -293,6 +305,159 @@ def test_non_tty_interval_frames_have_no_escapes_or_clears() raises:
         assert_equal(_count(captured, "denoising step"), pair[1])
         assert_equal(captured.find("\u001b"), -1)
         assert_equal(_count(captured, "\n\n"), pair[1] * 2)
+
+
+def test_answer_is_not_printed_twice_on_a_terminal() raises:
+    # The last canvas frame already holds the answer when a terminal shows it.
+    assert_true(not prints_answer(True, True))
+    assert_true(prints_answer(False, True))
+    assert_true(prints_answer(True, False))
+    assert_true(prints_answer(False, False))
+
+
+def _tiny_gen_config(threshold: Float64 = 0.0) -> GenConfig:
+    var cfg = GenConfig()
+    cfg.gen_length = 8
+    cfg.block_length = 8
+    cfg.steps = 8
+    cfg.threshold = threshold
+    return cfg^
+
+
+def _run_json(
+    mut model: DiffusionLM,
+    prompt: List[Int],
+    var tok: Tokenizer,
+    var cfg: GenConfig,
+    early_stop: Bool,
+) raises -> String:
+    """What `run --json` prints for the tiny model, with the tokenizer given."""
+    var raw = List[String]()
+    raw.append("mojo-dllm")
+    raw.append("run")
+    raw.append("--json")
+    if not early_stop:
+        raw.append("--no-early-stop")
+    var args = Args(
+        raw,
+        ["visual-interval"],
+        ["json", "no-early-stop", "verbose", "dump-step-stats", "visual"],
+    )
+    var output = _OutputCapture()
+    try:
+        _run(model, args, cfg^, prompt, tok^, 0.0, "cpu", "cpu")
+    except e:
+        _ = output.finish()
+        raise Error("_run failed: " + String(e))
+    return output.finish()
+
+
+def test_run_json_prints_one_line_and_nothing_else_on_stdout() raises:
+    # A consumer calls json.loads on stdout: the object must be all of it.
+    var tok = _tokenizer()
+    var model = DiffusionLM(FIX + "tiny-llada.gguf", threads=1, max_tokens=16)
+    var prompt: List[Int] = [5, 17, 300]
+    var text = _run_json(model, prompt, tok^, _tiny_gen_config(), True)
+    assert_true(text.startswith('{"runtime": "mojo-dllm"'))
+    assert_true(text.endswith("}\n"))
+    assert_equal(_count(text, "\n"), 1)
+    # Braces balance outside strings: a stray diagnostic would break this.
+    var depth = 0
+    var in_string = False
+    var escaped = False
+    for b in text.as_bytes():
+        var c = Int(b)
+        if in_string:
+            if escaped:
+                escaped = False
+            elif c == 92:
+                escaped = True
+            elif c == 34:
+                in_string = False
+        elif c == 34:
+            in_string = True
+        elif c == 123:
+            depth += 1
+        elif c == 125:
+            depth -= 1
+    assert_equal(depth, 0)
+
+
+def test_run_json_reports_the_threads_of_the_run_config() raises:
+    # One thread count: `_run` reads it from the config it was given, and
+    # there is no second parameter that could disagree.
+    var tok = _tokenizer()
+    var model = DiffusionLM(FIX + "tiny-llada.gguf", threads=1, max_tokens=16)
+    var prompt: List[Int] = [5, 17, 300]
+    var cfg = _tiny_gen_config()
+    cfg.threads = 3
+    var text = _run_json(model, prompt, tok^, cfg^, True)
+    assert_true(text.find('"threads": 3, "prompt_tokens": 3') > 0)
+
+
+def test_run_text_ends_at_the_first_end_of_generation_token() raises:
+    # With early stop off the whole canvas is generated, so only the cut in
+    # `_run` decides what the answer holds. The stop token is the first one that
+    # differs from the token the tiny model writes first, given as end-of-turn
+    # and then as EOS.
+    var model = DiffusionLM(FIX + "tiny-llada.gguf", threads=1, max_tokens=16)
+    var prompt: List[Int] = [5, 17, 300]
+    var plain = _tiny_gen_config()
+    plain.early_stop = False
+    var canvas = generate(model, prompt, plain).tokens.copy()
+    var gen = List[Int]()
+    for i in range(len(prompt), len(canvas)):
+        gen.append(canvas[i])
+    assert_equal(len(gen), 8)
+    var at = 1
+    while at < len(gen) - 1 and gen[at] == gen[0]:
+        at += 1
+    var stop = gen[at]
+    var kept = List[Int]()
+    for i in range(at):
+        kept.append(gen[i])
+    var tok = _tokenizer()
+    var want = tok.decode(kept)
+    # Not vacuous: some of the text comes before the stop token, and keeping
+    # everything would print more.
+    assert_true(at > 0 and want.byte_length() > 0, "nothing before the stop")
+    assert_true(tok.decode(gen) != want, "the cut changes nothing")
+    var line = ', "text": ' + json_str(want) + "}"
+
+    var as_eot = _tokenizer()
+    as_eot.eot_id = stop
+    var out = _run_json(model, prompt, as_eot^, _tiny_gen_config(), False)
+    assert_true(out.find(line) >= 0, "end-of-turn did not cut: " + out)
+
+    var as_eos = _tokenizer()
+    as_eos.eos_id = stop
+    as_eos.eot_id = -1
+    out = _run_json(model, prompt, as_eos^, _tiny_gen_config(), False)
+    assert_true(out.find(line) >= 0, "EOS did not cut: " + out)
+
+
+def test_run_stops_early_on_the_end_of_generation_id_of_either_kind() raises:
+    # The first token written is the stop token, as end-of-turn and as EOS.
+    var model = DiffusionLM(FIX + "tiny-llada.gguf", threads=1, max_tokens=16)
+    var prompt: List[Int] = [5, 17, 300]
+    var probe = _tiny_gen_config(1e-30)
+    probe.early_stop = False
+    var first = _FirstStep(511)
+    _ = generate_observed(model, prompt, probe, first)
+    assert_equal(first.first_resolved_step, 1)
+    var stop = first.tokens[3]
+
+    var as_eot = _tokenizer()
+    as_eot.eot_id = stop
+    var out = _run_json(model, prompt, as_eot^, _tiny_gen_config(1e-30), True)
+    assert_true(out.find('"stopped_early": true') >= 0, "eot: " + out)
+    assert_true(out.find(', "text": ""}') >= 0, "eot text: " + out)
+
+    var as_eos = _tokenizer()
+    as_eos.eos_id = stop
+    out = _run_json(model, prompt, as_eos^, _tiny_gen_config(1e-30), True)
+    assert_true(out.find('"stopped_early": true') >= 0, "eos: " + out)
+    assert_true(out.find(', "text": ""}') >= 0, "eos text: " + out)
 
 
 def main() raises:

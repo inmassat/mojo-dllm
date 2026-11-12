@@ -11,11 +11,19 @@ from mojo_dllm.diffusion.sampler import (
     _confidence,
     _confidence_from_stats,
     _greedy_rows,
+    _gumbel_argmax,
     StepObserver,
     generate_observed,
 )
-from mojo_dllm.models.transformer import DiffusionLM, RowStats
-from mojo_dllm.sys.mem import Floats
+from mojo_dllm.formats.gguf import GGUFFile
+from mojo_dllm.models.transformer import (
+    DenoisingModel,
+    DiffusionLM,
+    ModelConfig,
+    RowStats,
+    Timings,
+)
+from mojo_dllm.sys.mem import F32Ptr, Floats
 
 comptime FIX = "tests/fixtures/"
 
@@ -63,6 +71,18 @@ def test_argmax_and_prob_in_f64() raises:
     assert_true(abs(r[1] - 1.0 / z) < 1e-12, "prob " + String(r[1]))
 
 
+def test_rng_below_refuses_a_bound_that_is_not_positive() raises:
+    var r = Rng(5)
+    assert_equal(r.below(1), 0)
+    for _ in range(50):
+        var v = r.below(7)
+        assert_true(v >= 0 and v < 7)
+    with assert_raises(contains="Rng.below needs a positive bound, got 0"):
+        _ = r.below(0)
+    with assert_raises(contains="Rng.below needs a positive bound, got -3"):
+        _ = r.below(-3)
+
+
 def test_rng_is_deterministic() raises:
     var a = Rng(42)
     var b = Rng(42)
@@ -78,7 +98,15 @@ def _tiny_cfg() -> GenConfig:
     c.gen_length = 8
     c.block_length = 4
     c.steps = 4
-    c.mask_id = 511
+    return c^
+
+
+def _tiny_dream_cfg() -> GenConfig:
+    # Same shape as `_tiny_cfg`; the mask id comes from the model.
+    var c = GenConfig()
+    c.gen_length = 8
+    c.block_length = 4
+    c.steps = 4
     return c^
 
 
@@ -123,13 +151,10 @@ def test_sampler_threads_do_not_change_tokens() raises:
     for path in ["tiny-llada.gguf", "tiny-dream.gguf"]:
         var m = DiffusionLM(FIX + path, threads=2, max_tokens=16)
         var prompt: List[Int] = [5, 17, 300]
-        var mask = 510 if path == "tiny-dream.gguf" else 511
         var one = _tiny_cfg()
         one.threads = 1
-        one.mask_id = mask
         var four = _tiny_cfg()
         four.threads = 4
-        four.mask_id = mask
         var a = generate(m, prompt, one)
         var b = generate(m, prompt, four)
         assert_equal(len(a.tokens), len(b.tokens))
@@ -183,7 +208,6 @@ def _check_early_stop(path: String, mask: Int, block: Int) raises:
     c.gen_length = 16
     c.block_length = block
     c.steps = 16
-    c.mask_id = mask
     c.early_stop = False
     var full = generate(m, prompt, c)
     var saved_any = False
@@ -221,12 +245,50 @@ def test_early_stop_keeps_the_visible_answer_dream() raises:
     _check_early_stop("tiny-dream.gguf", 510, 16)
 
 
+def _check_stop_report(path: String, mask: Int, block: Int) raises:
+    # `--json` reports steps_taken and stop_reason for every model: the passes
+    # run, and why the loop ended ("answer_fixed" exactly when it stopped early).
+    var m = DiffusionLM(FIX + path, threads=2, max_tokens=24)
+    var prompt: List[Int] = [5, 17, 300]
+    var c = GenConfig()
+    c.gen_length = 16
+    c.block_length = block
+    c.steps = 16
+    c.early_stop = False
+    var full = generate(m, prompt, c)
+    assert_equal(full.steps_taken(), full.forward_passes)
+    assert_equal(full.stop_reason, "complete", path)
+    assert_true(not full.stopped_early)
+    var fixed = 0
+    for i in range(len(prompt), len(full.tokens)):
+        var e = c.copy()
+        e.early_stop = True
+        e.stop_ids = [full.tokens[i]]
+        var early = generate(m, prompt, e)
+        assert_equal(early.steps_taken(), early.forward_passes)
+        if early.stopped_early:
+            fixed += 1
+            assert_equal(early.stop_reason, "answer_fixed", path)
+            break
+        assert_equal(early.stop_reason, "complete", path)
+    assert_true(
+        fixed > 0, path + ": no run stopped early, so the check is vacuous"
+    )
+
+
+def test_llada_json_members_report_steps_and_reason() raises:
+    _check_stop_report("tiny-llada.gguf", 511, 4)
+
+
+def test_dream_json_members_report_steps_and_reason() raises:
+    _check_stop_report("tiny-dream.gguf", 510, 16)
+
+
 def _threshold_cfg(threshold: Float64) -> GenConfig:
     var c = GenConfig()
     c.gen_length = 16
     c.block_length = 8
     c.steps = 16
-    c.mask_id = 511
     c.early_stop = False
     c.threshold = threshold
     return c^
@@ -310,6 +372,150 @@ def test_rejects_bad_block_geometry() raises:
         _ = generate(m, prompt, c)
 
 
+def test_generate_refuses_a_temperature_that_is_not_a_number_or_negative() raises:
+    # `nan > 0` is false, so a NaN temperature read as greedy decoding.
+    var m = DiffusionLM(FIX + "tiny-llada.gguf", threads=2, max_tokens=16)
+    var prompt: List[Int] = [5]
+    var c = _tiny_cfg()
+    c.temperature = Float64("nan")
+    with assert_raises(contains="--temperature must be a finite number, got"):
+        _ = generate(m, prompt, c)
+    c = _tiny_cfg()
+    c.temperature = -0.5
+    with assert_raises(contains="--temperature must be at least 0, got -0.5"):
+        _ = generate(m, prompt, c)
+
+
+# The eleven refusals below each pin one guard in the sampler. Every config
+# starts from a tiny cfg that generates cleanly, then flips the one field the
+# guard reads, so the assert fails if that guard is removed. #144.
+
+
+def test_llada_rejects_nonpositive_geometry() raises:
+    # sampler.mojo `_generate_llada`: gen_length/block_length/steps must be
+    # positive. The block_length case also guards the `gen_length %
+    # block_length` modulo just below it from dividing by zero.
+    var m = DiffusionLM(FIX + "tiny-llada.gguf", threads=2, max_tokens=16)
+    var prompt: List[Int] = [5]
+    var c = _tiny_cfg()
+    c.gen_length = 0
+    with assert_raises(contains="block length and steps must be positive"):
+        _ = generate(m, prompt, c)
+    c = _tiny_cfg()
+    c.block_length = 0
+    with assert_raises(contains="block length and steps must be positive"):
+        _ = generate(m, prompt, c)
+    c = _tiny_cfg()
+    c.steps = 0
+    with assert_raises(contains="block length and steps must be positive"):
+        _ = generate(m, prompt, c)
+
+
+def test_llada_rejects_dual_cache_with_full_logits() raises:
+    # The K/V cache recomputes only one block, so it cannot report every row's
+    # logits; asking for both is refused rather than silently truncated.
+    var m = DiffusionLM(FIX + "tiny-llada.gguf", threads=2, max_tokens=16)
+    var prompt: List[Int] = [5]
+    var c = _tiny_cfg()
+    c.dual_cache = True
+    c.full_logits = True
+    with assert_raises(contains="cannot give every row's logits"):
+        _ = generate(m, prompt, c)
+
+
+def test_llada_rejects_negative_threshold() raises:
+    var m = DiffusionLM(FIX + "tiny-llada.gguf", threads=2, max_tokens=16)
+    var prompt: List[Int] = [5]
+    var c = _tiny_cfg()
+    c.threshold = -0.5
+    with assert_raises(contains="threshold must not be negative"):
+        _ = generate(m, prompt, c)
+
+
+def test_llada_rejects_threshold_with_random_remasking() raises:
+    # A confidence threshold ranks candidates by confidence; random remasking
+    # has no confidence to rank, so the combination is meaningless.
+    var m = DiffusionLM(FIX + "tiny-llada.gguf", threads=2, max_tokens=16)
+    var prompt: List[Int] = [5]
+    var c = _tiny_cfg()
+    c.threshold = 0.5
+    c.remasking = "random"
+    with assert_raises(contains="needs low_confidence remasking"):
+        _ = generate(m, prompt, c)
+
+
+def test_llada_rejects_unknown_remasking() raises:
+    var m = DiffusionLM(FIX + "tiny-llada.gguf", threads=2, max_tokens=16)
+    var prompt: List[Int] = [5]
+    var c = _tiny_cfg()
+    c.remasking = "bogus"
+    with assert_raises(contains="unknown remasking strategy"):
+        _ = generate(m, prompt, c)
+
+
+def test_dream_rejects_nonpositive_geometry() raises:
+    # sampler.mojo `_generate_dream`: gen_length and steps must be positive.
+    var m = DiffusionLM(FIX + "tiny-dream.gguf", threads=2, max_tokens=16)
+    var prompt: List[Int] = [5]
+    var c = _tiny_dream_cfg()
+    c.gen_length = 0
+    with assert_raises(contains="generation length and steps must be positive"):
+        _ = generate(m, prompt, c)
+    c = _tiny_dream_cfg()
+    c.steps = 0
+    with assert_raises(contains="generation length and steps must be positive"):
+        _ = generate(m, prompt, c)
+
+
+def test_dream_rejects_unknown_algorithm() raises:
+    # Dream maps low_confidence -> entropy, then accepts only its three
+    # algorithms; anything else is refused by name.
+    var m = DiffusionLM(FIX + "tiny-dream.gguf", threads=2, max_tokens=16)
+    var prompt: List[Int] = [5]
+    var c = _tiny_dream_cfg()
+    c.remasking = "bogus"
+    with assert_raises(contains="unknown Dream algorithm"):
+        _ = generate(m, prompt, c)
+
+
+def test_dream_rejects_positive_temperature() raises:
+    var m = DiffusionLM(FIX + "tiny-dream.gguf", threads=2, max_tokens=16)
+    var prompt: List[Int] = [5]
+    var c = _tiny_dream_cfg()
+    c.temperature = 0.7
+    with assert_raises(contains="temperature > 0 is not implemented"):
+        _ = generate(m, prompt, c)
+
+
+def test_dream_rejects_threshold() raises:
+    var m = DiffusionLM(FIX + "tiny-dream.gguf", threads=2, max_tokens=16)
+    var prompt: List[Int] = [5]
+    var c = _tiny_dream_cfg()
+    c.threshold = 0.5
+    with assert_raises(
+        contains="confidence threshold is implemented for LLaDA only"
+    ):
+        _ = generate(m, prompt, c)
+
+
+def test_dream_rejects_dual_cache() raises:
+    var m = DiffusionLM(FIX + "tiny-dream.gguf", threads=2, max_tokens=16)
+    var prompt: List[Int] = [5]
+    var c = _tiny_dream_cfg()
+    c.dual_cache = True
+    with assert_raises(contains="K/V cache is implemented for LLaDA only"):
+        _ = generate(m, prompt, c)
+
+
+def test_dream_rejects_empty_prompt() raises:
+    # The sharpest of the eleven: Dream scores a position from the row before
+    # it, so an empty prompt would index row -1 without this guard.
+    var m = DiffusionLM(FIX + "tiny-dream.gguf", threads=2, max_tokens=16)
+    var prompt: List[Int] = []
+    with assert_raises(contains="at least one prompt token"):
+        _ = generate(m, prompt, _tiny_dream_cfg())
+
+
 def test_dream_confidences() raises:
     var row = Floats(3)
     row[0] = 0.0
@@ -337,7 +543,6 @@ def test_dream_generation_resolves_every_mask() raises:
     var c = GenConfig()
     c.gen_length = 8
     c.steps = 4
-    c.mask_id = 510
     var out = generate(m, prompt, c)
     assert_equal(len(out.tokens), 11)
     for i in range(3, 11):
@@ -379,7 +584,6 @@ def test_observer_sees_dream_commits() raises:
     var c = GenConfig()
     c.gen_length = 8
     c.steps = 4
-    c.mask_id = 510
     var rec = Recorder()
     _ = generate_observed(m, prompt, c, rec)
     assert_equal(rec.committed, 8)
@@ -426,6 +630,290 @@ def test_confidence_from_row_statistics_matches_the_full_row() raises:
             abs(got - w[1]) < 1e-9,
             algo + ": " + String(got) + " against " + String(w[1]),
         )
+
+
+def test_rng_matches_the_xoshiro256_starstar_reference() raises:
+    # Known answers from an independent Python implementation of splitmix64
+    # (the seed expansion) and xoshiro256** (Blackman and Vigna's definition).
+    var a = Rng(0)
+    assert_equal(a.s0, UInt64(0xE220A8397B1DCDAF))
+    assert_equal(a.s1, UInt64(0x6E789E6AA1B965F4))
+    assert_equal(a.s2, UInt64(0x06C45D188009454F))
+    assert_equal(a.s3, UInt64(0xF88BB8A8724C81EC))
+    assert_equal(a.next_u64(), UInt64(0x99EC5F36CB75F2B4))
+    assert_equal(a.next_u64(), UInt64(0xBF6E1F784956452A))
+    assert_equal(a.next_u64(), UInt64(0x1A5F849D4933E6E0))
+    var b = Rng(42)
+    assert_equal(b.s0, UInt64(0xBDD732262FEB6E95))
+    assert_equal(b.s1, UInt64(0x28EFE333B266F103))
+    assert_equal(b.s2, UInt64(0x47526757130F9F52))
+    assert_equal(b.s3, UInt64(0x581CE1FF0E4AE394))
+    assert_equal(b.next_u64(), UInt64(0x15780B2E0C2EC716))
+    assert_equal(b.next_u64(), UInt64(0x6104D9866D113A7E))
+    assert_equal(b.next_u64(), UInt64(0xAE17533239E499A1))
+    assert_equal(b.next_u64(), UInt64(0xECB8AD4703B360A1))
+
+
+def test_rng_uniform_and_below_scale_the_53_high_bits() raises:
+    var r = Rng(0)
+    assert_equal(r.uniform(), 0.6012629994179048)
+    assert_equal(r.uniform(), 0.7477740925472398)
+    assert_equal(r.uniform(), 0.10301998939503637)
+    var s = Rng(0)
+    var want: List[Int] = [4, 5, 0, 2, 5, 6]
+    for w in want:
+        assert_equal(s.below(7), w)
+    var t = Rng(0)
+    var want_k: List[Int] = [601, 747, 103, 416, 732, 999]
+    for w in want_k:
+        assert_equal(t.below(1000), w)
+
+
+def _gumbel_frequency(
+    logits: Floats, temperature: Float64, draws: Int, seed: Int, index: Int
+) -> Float64:
+    var rng = Rng(seed)
+    var hits = 0
+    for _ in range(draws):
+        if _gumbel_argmax(logits.ptr(), logits.n, temperature, rng) == index:
+            hits += 1
+    return Float64(hits) / Float64(draws)
+
+
+def test_gumbel_draw_follows_softmax_of_logits_over_temperature() raises:
+    # With logits [0, T ln 3] the draw picks index 1 with probability
+    # exp(ln 3) / (1 + exp(ln 3)) = 3/4, whatever T is. A noise scale other
+    # than T moves the frequency out of the band (no scale: 0.683).
+    var t = Float64(0.7)
+    var logits = Floats(2)
+    logits[0] = 0.0
+    logits[1] = Float32(t * log(3.0))
+    var f = _gumbel_frequency(logits, t, 20000, 1, 1)
+    assert_true(f >= 0.74 and f <= 0.76, "frequency " + String(f))
+    # Same logits at T = 2: 3^(0.35) / (1 + 3^(0.35)) = 0.595.
+    var f2 = _gumbel_frequency(logits, 2.0, 20000, 1, 1)
+    assert_true(
+        f2 >= 0.575 and f2 <= 0.615, "frequency at T = 2: " + String(f2)
+    )
+    # The draw is a function of the seed only.
+    assert_equal(f, _gumbel_frequency(logits, t, 20000, 1, 1))
+
+
+def test_gumbel_draw_with_three_candidates_follows_the_softmax() raises:
+    # Two candidates cannot tell the noise from its mirror image (the
+    # difference of two Gumbel variables is symmetric); three can. Logits
+    # T ln 1, T ln 2, T ln 3 give 1/6, 1/3 and 1/2; a draw that subtracted
+    # the noise instead of adding it gives about 0.13, 0.34 and 0.53.
+    var t = Float64(0.7)
+    var logits = Floats(3)
+    for i in range(3):
+        logits[i] = Float32(t * log(Float64(i + 1)))
+    for i in range(3):
+        var want = Float64(i + 1) / 6.0
+        var f = _gumbel_frequency(logits, t, 20000, 3, i)
+        assert_true(
+            abs(f - want) < 0.015,
+            "index " + String(i) + ": frequency " + String(f),
+        )
+
+
+def test_gumbel_draw_at_a_vanishing_temperature_is_the_argmax() raises:
+    var logits = Floats(5)
+    logits[0] = 0.3
+    logits[1] = -1.0
+    logits[2] = 2.5
+    logits[3] = 2.4
+    logits[4] = 0.0
+    var rng = Rng(7)
+    for _ in range(200):
+        assert_equal(_gumbel_argmax(logits.ptr(), 5, 1e-6, rng), 2)
+
+
+# ---- which positions the LLaDA and Dream samplers commit (#213) ---------------
+#
+# `tests/fixtures/golden-generation.tsv` holds what this implementation
+# produced. A sampler that commits the wrong positions, or takes a candidate
+# index for a position, can still match it. Here a scripted model gives every
+# candidate a row of known confidence, so the committed positions are worked
+# out by hand.
+
+comptime SCRIPT_VOCAB = 8
+comptime SCRIPT_MASK = 4
+
+
+struct _ScriptedModel(DenoisingModel, Movable):
+    """Answers forward call k with script[k]: rows in the order of `out_rows`,
+    [row][vocab]. Records the rows each call asked for."""
+
+    var cfg: ModelConfig
+    var script: List[List[Float32]]
+    var asked: List[List[Int]]
+
+    def __init__(
+        out self, arch: String, var script: List[List[Float32]]
+    ) raises:
+        self.cfg = ModelConfig(GGUFFile(FIX + "tiny-llada.gguf"))
+        self.cfg.arch = arch
+        self.cfg.vocab = SCRIPT_VOCAB
+        self.cfg.mask_id = SCRIPT_MASK
+        self.cfg.shift_logits = arch == "dream"
+        self.script = script^
+        self.asked = List[List[Int]]()
+
+    def config(self) -> ModelConfig:
+        return self.cfg
+
+    def logit_row(self, position: Int) -> Int:
+        return position - 1 if self.cfg.shift_logits else position
+
+    def forward(
+        mut self, tokens: List[Int], out_rows: List[Int], logits: F32Ptr
+    ) raises:
+        var call = len(self.asked)
+        self.asked.append(out_rows.copy())
+        assert_true(call < len(self.script), "more forward calls than scripted")
+        var rows = self.script[call].copy()
+        assert_equal(
+            len(rows), len(out_rows) * SCRIPT_VOCAB, "script rows of call"
+        )
+        for i in range(len(rows)):
+            logits[unsafe_offset=i] = rows[i]
+
+    def forward_window(
+        mut self,
+        tokens: List[Int],
+        lo: Int,
+        hi: Int,
+        out_rows: List[Int],
+        logits: F32Ptr,
+    ) raises:
+        raise Error("the scripted model has no window")
+
+    def device_row_stats(self) -> Bool:
+        return False
+
+    def forward_stats(
+        mut self, tokens: List[Int], out_rows: List[Int], mut out: RowStats
+    ) raises:
+        raise Error("the scripted model has no device row statistics")
+
+    def model_name(self) raises -> String:
+        return "scripted"
+
+    def load_time(self) -> Float64:
+        return 0.0
+
+    def stats(self) -> Timings:
+        return Timings()
+
+
+struct _Steps(Movable, StepObserver):
+    var committed: List[List[Int]]
+    var canvas: List[List[Int]]
+
+    def __init__(out self):
+        self.committed = List[List[Int]]()
+        self.canvas = List[List[Int]]()
+
+    def on_step(
+        mut self, tokens: List[Int], committed: List[Int], step: Int, total: Int
+    ) raises:
+        self.committed.append(committed.copy())
+        self.canvas.append(tokens.copy())
+
+
+def _scripted_rows(tops: List[Int], margins: List[Int]) -> List[Float32]:
+    """One row per candidate: zero everywhere but `margin` at its top token,
+    so the argmax is `top` and a larger margin is a higher confidence under
+    every confidence measure the samplers use."""
+    var out = List[Float32]()
+    for j in range(len(tops)):
+        for v in range(SCRIPT_VOCAB):
+            out.append(Float32(margins[j]) if v == tops[j] else Float32(0))
+    return out^
+
+
+def _assert_list(got: List[Int], want: List[Int], what: String) raises:
+    assert_equal(len(got), len(want), what + ": length")
+    for i in range(len(want)):
+        assert_equal(got[i], want[i], what + " [" + String(i) + "]")
+
+
+def test_llada_commits_the_most_confident_positions() raises:
+    # Prompt [1, 2], four masked slots at positions 2..5, two steps. Step 1
+    # candidates are 2, 3, 4, 5 with margins 1, 4, 2, 3: the two most confident
+    # are candidates 1 and 3, that is positions 3 and 5 (not 1 and 3, the
+    # candidate indices). Step 2 has candidates 2 and 4 with margins 2 and 5.
+    var script = List[List[Float32]]()
+    script.append(_scripted_rows([5, 6, 7, 5], [1, 4, 2, 3]))
+    script.append(_scripted_rows([7, 6], [2, 5]))
+    var m = _ScriptedModel("llada", script^)
+    var c = GenConfig()
+    c.gen_length = 4
+    c.block_length = 4
+    c.steps = 2
+    c.early_stop = False
+    var obs = _Steps()
+    var prompt: List[Int] = [1, 2]
+    var r = generate_observed(m, prompt, c, obs)
+    assert_equal(len(obs.committed), 2)
+    _assert_list(obs.committed[0], [3, 5], "step 1 committed")
+    _assert_list(obs.committed[1], [4, 2], "step 2 committed")
+    _assert_list(obs.canvas[0], [1, 2, 4, 6, 4, 5], "canvas after step 1")
+    _assert_list(r.tokens, [1, 2, 7, 6, 6, 5], "final canvas")
+    _assert_list(m.asked[0], [2, 3, 4, 5], "rows of step 1")
+    _assert_list(m.asked[1], [2, 4], "rows of step 2")
+    assert_equal(r.forward_passes, 2)
+
+
+def test_llada_commits_per_block_and_keeps_earlier_blocks() raises:
+    # Two blocks of two slots, two steps: one commit per step inside a block.
+    var script = List[List[Float32]]()
+    script.append(_scripted_rows([5, 6], [3, 1]))
+    script.append(_scripted_rows([7], [1]))
+    script.append(_scripted_rows([6, 5], [1, 4]))
+    script.append(_scripted_rows([1], [1]))
+    var m = _ScriptedModel("llada", script^)
+    var c = GenConfig()
+    c.gen_length = 4
+    c.block_length = 2
+    c.steps = 4
+    c.early_stop = False
+    var obs = _Steps()
+    var prompt: List[Int] = [1, 2]
+    var r = generate_observed(m, prompt, c, obs)
+    _assert_list(obs.committed[0], [2], "block 0 step 1")
+    _assert_list(obs.committed[1], [3], "block 0 step 2")
+    _assert_list(obs.committed[2], [5], "block 1 step 1")
+    _assert_list(obs.committed[3], [4], "block 1 step 2")
+    _assert_list(r.tokens, [1, 2, 5, 7, 1, 5], "final canvas")
+    _assert_list(m.asked[2], [4, 5], "rows of block 1 step 1")
+
+
+def test_dream_commits_its_schedule_in_confidence_order() raises:
+    # Four slots at positions 2..5 and three steps. n_transfer is
+    # int(n_masked * (1 - s/t)): 1 of 4, 1 of 3, then the last 2. Dream's
+    # logits are shifted, so the rows asked for are position - 1.
+    var script = List[List[Float32]]()
+    script.append(_scripted_rows([5, 6, 7, 5], [1, 4, 2, 3]))
+    script.append(_scripted_rows([7, 5, 6], [3, 1, 2]))
+    script.append(_scripted_rows([6, 1], [2, 5]))
+    var m = _ScriptedModel("dream", script^)
+    var c = GenConfig()
+    c.gen_length = 4
+    c.steps = 3
+    c.early_stop = False
+    var obs = _Steps()
+    var prompt: List[Int] = [1, 2]
+    var r = generate_observed(m, prompt, c, obs)
+    assert_equal(len(obs.committed), 3)
+    _assert_list(obs.committed[0], [3], "step 1 committed")
+    _assert_list(obs.committed[1], [2], "step 2 committed")
+    _assert_list(obs.committed[2], [5, 4], "step 3 committed")
+    _assert_list(m.asked[0], [1, 2, 3, 4], "rows of step 1")
+    _assert_list(m.asked[1], [1, 3, 4], "rows of step 2")
+    _assert_list(m.asked[2], [3, 4], "rows of step 3")
+    _assert_list(r.tokens, [1, 2, 7, 6, 6, 1], "final canvas")
 
 
 def main() raises:
