@@ -79,6 +79,9 @@ build() {
     need "${MOJO%% *}" || return 1
     bash scripts/build.sh
 }
+check_build_id() {
+    bash scripts/check_build_id.sh
+}
 shell_lint() {
     need shellcheck && shellcheck --severity=warning scripts/*.sh .githooks/*
 }
@@ -116,6 +119,7 @@ step "hygiene (secrets, employer name)" hygiene
 step "mojo format" fmt_check
 step "build -Werror" build
 if [ "$mode" = full ]; then
+    step "embedded build commit" check_build_id
     step "tests (count pinned)" bash scripts/run-tests.sh
     step "--device gpu without a GPU fails cleanly" bash scripts/check_no_gpu.sh
     step "--visual-interval errors before model loading" bash scripts/check_visual.sh
